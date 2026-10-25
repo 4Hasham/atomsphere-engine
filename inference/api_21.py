@@ -30,8 +30,9 @@ REPO_DIR = "/root/hy21"
 HF_CACHE = "/root/.cache/huggingface"
 
 hunyuan21_image = (
-    # 2.1 is tested on Python 3.10 + PyTorch 2.5.1/CUDA 12.4; bpy 4.0 needs Python 3.10.
-    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.10")
+    # 2.1 is tested on PyTorch 2.5.1/CUDA 12.4. Its requirements pin bpy==4.0 on Python
+    # 3.10, but bpy 4.0 is gone from PyPI; the oldest left is 4.2, which needs Python 3.11.
+    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")
     .apt_install(
         "git",
         "wget",
@@ -109,7 +110,7 @@ hunyuan21_image = (
         "cupy-cuda12x==13.4.1",
         "fast-simplification",  # trimesh decimation fallback
     )
-    .pip_install("numpy==1.24.4", "bpy==4.0")
+    .pip_install("numpy==1.24.4", "bpy==4.2.23")  # Blender 4.2 LTS; see add_python above
     .pip_install(
         "numpy==1.24.4",
         "fastapi[standard]==0.115.12",
@@ -228,6 +229,46 @@ def cleanup_and_decimate(mesh, max_faces: int):
         if len(mesh.faces) > max_faces:
             mesh = mesh.simplify_quadric_decimation(face_count=max_faces)
     return mesh
+
+
+def export_glb_without_blender(obj_path: str, glb_path: str) -> None:
+    """Builds the GLB from the paint pipeline's OBJ + MTL + texture maps with trimesh.
+
+    Used when Blender's export produces nothing (it swallows its own errors, and
+    headless bpy can lack a window/context). Keeps the PBR maps: glTF packs roughness
+    in the green channel and metallic in the blue channel of one texture.
+    """
+    import numpy as np
+    import trimesh
+    from PIL import Image
+
+    folder = os.path.dirname(obj_path)
+    maps = {}
+    with open(os.path.splitext(obj_path)[0] + ".mtl", encoding="utf-8", errors="ignore") as mtl:
+        for line in mtl:
+            parts = line.split()
+            if parts and parts[0] in ("map_Kd", "map_Pm", "map_Pr", "map_Bump"):
+                maps[parts[0]] = os.path.join(folder, parts[-1])
+
+    mesh = trimesh.load(obj_path, process=False, force="mesh")
+    material = {"baseColorTexture": Image.open(maps["map_Kd"]).convert("RGB")}
+    if "map_Pm" in maps and "map_Pr" in maps:
+        metallic = np.asarray(Image.open(maps["map_Pm"]).convert("L"))
+        roughness = np.asarray(Image.open(maps["map_Pr"]).convert("L"))
+        packed = np.stack([np.zeros_like(roughness), roughness, metallic], axis=-1)
+        material.update(
+            metallicRoughnessTexture=Image.fromarray(packed),
+            metallicFactor=1.0,
+            roughnessFactor=1.0,
+        )
+    if "map_Bump" in maps:
+        material["normalTexture"] = Image.open(maps["map_Bump"]).convert("RGB")
+
+    mesh.visual = trimesh.visual.TextureVisuals(
+        uv=mesh.visual.uv,
+        material=trimesh.visual.material.PBRMaterial(**material),
+    )
+    mesh.export(glb_path)
 
 
 def describe_pbr(glb_path: str) -> str:
@@ -424,9 +465,13 @@ class Hunyuan21Model:
             )
             log_stage("Stage 2 PBR texture painting", started)
 
-            # convert_obj_to_glb swallows Blender errors and returns False; check the file
-            # so a failed export fails the job instead of uploading nothing.
+            # convert_obj_to_glb swallows Blender errors and returns False, so check the
+            # file: fall back to building it without Blender, and fail the job (rather
+            # than upload nothing) if that fails too.
             glb_path = Path(textured_obj).with_suffix(".glb")
+            if not glb_path.exists() or glb_path.stat().st_size == 0:
+                print("--> Blender GLB export produced nothing; exporting with trimesh", flush=True)
+                export_glb_without_blender(textured_obj, str(glb_path))
             if not glb_path.exists() or glb_path.stat().st_size == 0:
                 raise RuntimeError(f"GLB export failed: {glb_path} is missing or empty.")
             glb_data = glb_path.read_bytes()

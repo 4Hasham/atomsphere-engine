@@ -8,6 +8,8 @@ const sqs = new SQSClient({ region });
 const s3 = new S3Client({ region });
 const dynamodb = new DynamoDBClient({ region });
 const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+const MAX_TITLE_LENGTH = 80;
+const MAX_DESCRIPTION_LENGTH = 500;
 const ALLOWED_CATEGORIES = new Set([
   'building_structure',
   'mechanical_device',
@@ -135,6 +137,15 @@ function decodeImage(payload) {
   return decodeImageFile(payload.fileBase64, payload.contentType);
 }
 
+/** Optional user-entered text: trimmed, control characters removed, length-checked. */
+function readOptionalText(value, field, maxLength) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string') throw new Error(`${field} must be a string.`);
+  const text = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+  if (text.length > maxLength) throw new Error(`${field} must be ${maxLength} characters or fewer.`);
+  return text;
+}
+
 export const handler = async (event) => {
   const method = event && (
     event.httpMethod ||
@@ -211,6 +222,15 @@ export const handler = async (event) => {
     return jsonResponse(400, { error: 'Choose a valid model category.' });
   }
 
+  let title;
+  let description;
+  try {
+    title = readOptionalText(payload.title, 'title', MAX_TITLE_LENGTH);
+    description = readOptionalText(payload.description, 'description', MAX_DESCRIPTION_LENGTH);
+  } catch (error) {
+    return jsonResponse(400, { error: error.message });
+  }
+
   if (payload.model !== undefined && payload.model !== null) {
     if (typeof payload.model !== 'string' || !['hunyuan', 'meshy'].includes(payload.model.trim().toLowerCase())) {
       return jsonResponse(400, { error: 'model must be either "hunyuan" or "meshy".' });
@@ -285,6 +305,8 @@ export const handler = async (event) => {
   if (typeof payload.prompt === 'string' && payload.prompt.trim()) {
     item.prompt = { S: payload.prompt.trim() };
   }
+  if (title) item.title = { S: title };
+  if (description) item.description = { S: description };
 
   try {
     await dynamodb.send(new PutItemCommand({

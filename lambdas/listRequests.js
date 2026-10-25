@@ -50,8 +50,17 @@ export const handler = async (event) => {
         IndexName: indexName,
         KeyConditionExpression: 'owner_id = :ownerId',
         ExpressionAttributeValues: { ':ownerId': ownerId },
-        ProjectionExpression: 'job_id, #status, created_at, updated_at, prompt, input_key, output_bucket, output_key',
-        ExpressionAttributeNames: { '#status': 'status' },
+        // Placeholders for every newer field, so none can clash with a DynamoDB reserved word.
+        ProjectionExpression: 'job_id, #status, created_at, updated_at, prompt, input_key, output_bucket, output_key, '
+          + '#title, #description, #category, #input_mode, #model',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+          '#title': 'title',
+          '#description': 'description',
+          '#category': 'category',
+          '#input_mode': 'input_mode',
+          '#model': 'model',
+        },
         ScanIndexForward: false,
         ExclusiveStartKey: lastEvaluatedKey,
       }));

@@ -62,48 +62,65 @@ hunyuan21_image = (
     )
     # requirements.txt at the pinned commit, minus the demo UI (gradio, pythreejs),
     # training (deepspeed) and Tencent's PyPI mirrors; plus our own needs.
+    # Installed in small groups so a failure names its group, and with numpy pinned in
+    # each so no later group can pull in numpy 2 (the repo is built for 1.24).
     .pip_install(
+        "numpy==1.24.4",
+        "scipy==1.14.1",
+        "setuptools<70",
+        "wheel",
+        "cython",  # basicsr's setup_requires (with numpy and torch)
         "ninja==1.11.1.1",
         "pybind11==2.13.4",
+    )
+    .pip_install(
+        "numpy==1.24.4",
         "transformers==4.46.0",
         "diffusers==0.30.0",
         "accelerate==1.1.1",
         "pytorch-lightning==1.9.5",
         "huggingface-hub==0.30.2",
         "safetensors==0.4.4",
-        "numpy==1.24.4",
-        "scipy==1.14.1",
         "einops==0.8.0",
+        "torchmetrics==1.6.0",
+        "timm",
+        "torchdiffeq",
+        "kornia",  # BiRefNet
+    )
+    # basicsr ships only as source with setup_requires=[cython, numpy, torch]. In pip's
+    # isolated build setuptools tries to fetch its own torch and fails, so build it
+    # against the packages already installed above.
+    .run_commands(
+        "python -m pip install --no-build-isolation numpy==1.24.4 basicsr==1.4.2 realesrgan==0.3.0",
+    )
+    .pip_install(
+        "numpy==1.24.4",
         "pandas==2.2.2",
         "opencv-python==4.10.0.84",
         "imageio==2.36.0",
         "scikit-image==0.24.0",
         "rembg==2.0.65",
-        "realesrgan==0.3.0",
-        "tb_nightly==2.18.0a20240726",
-        "basicsr==1.4.2",
+        "onnxruntime==1.16.3",
         "trimesh==4.4.7",
         "pymeshlab==2022.2.post3",
         "pygltflib==1.16.3",
         "xatlas==0.0.9",
         "open3d==0.18.0",
+        "cupy-cuda12x==13.4.1",
+        "fast-simplification",  # trimesh decimation fallback
+    )
+    .pip_install("numpy==1.24.4", "bpy==4.0")
+    .pip_install(
+        "numpy==1.24.4",
+        "fastapi[standard]==0.115.12",
+        "pydantic==2.10.6",
         "omegaconf==2.3.0",
         "pyyaml==6.0.2",
         "configargparse==1.7",
-        "fastapi[standard]==0.115.12",
         "tqdm==4.66.5",
         "psutil==6.0.0",
-        "cupy-cuda12x==13.4.1",
-        "bpy==4.0",
-        "onnxruntime==1.16.3",
-        "torchmetrics==1.6.0",
-        "pydantic==2.10.6",
-        "timm",
-        "torchdiffeq",
-        # ours: S3, BiRefNet background removal, trimesh decimation fallback
+        "tb_nightly==2.18.0a20240726",
         "boto3",
-        "kornia",
-        "fast-simplification",
     )
     .run_commands(
         f"git clone {HUNYUAN21_REPO} {REPO_DIR} && cd {REPO_DIR} && git checkout {HUNYUAN21_COMMIT}",

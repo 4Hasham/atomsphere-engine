@@ -28,6 +28,7 @@ HUNYUAN21_REPO = "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1"
 HUNYUAN21_COMMIT = "82920d643c0dc2f7bfd7255f45f62d386edfe60c"
 REPO_DIR = "/root/hy21"
 HF_CACHE = "/root/.cache/huggingface"
+NATIVE_BUILD_ENV = "CC=gcc CXX=g++ LDSHARED='gcc -pthread -shared'"
 
 hunyuan21_image = (
     # 2.1 is tested on PyTorch 2.5.1/CUDA 12.4. Its requirements pin bpy==4.0 on Python
@@ -125,8 +126,18 @@ hunyuan21_image = (
     )
     .run_commands(
         f"git clone {HUNYUAN21_REPO} {REPO_DIR} && cd {REPO_DIR} && git checkout {HUNYUAN21_COMMIT}",
-        f"cd {REPO_DIR}/hy3dpaint/custom_rasterizer && python -m pip install --no-build-isolation -e .",
-        f"cd {REPO_DIR}/hy3dpaint/DifferentiableRenderer && bash compile_mesh_painter.sh",
+        # Native builds use the system gcc explicitly (as api.py does for 2.0): Modal's
+        # add_python Python records its own build toolchain, which isn't in this image.
+        f"cd {REPO_DIR}/hy3dpaint/custom_rasterizer && {NATIVE_BUILD_ENV} "
+        "python -m pip install --no-build-isolation -e .",
+        # compile_mesh_painter.sh relies on python3-config, which Modal's Python may not
+        # ship; take the extension suffix from sysconfig instead.
+        f"cd {REPO_DIR}/hy3dpaint/DifferentiableRenderer && g++ -O3 -Wall -shared -std=c++11 -fPIC "
+        "$(python -m pybind11 --includes) mesh_inpaint_processor.cpp -o mesh_inpaint_processor"
+        "$(python -c \"import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))\")",
+        # Fail the build here, not on the first job, if either native module won't load.
+        "python -c \"import torch, custom_rasterizer_kernel; print('custom_rasterizer OK')\"",
+        f"cd {REPO_DIR}/hy3dpaint/DifferentiableRenderer && python -c \"import mesh_inpaint_processor; print('mesh painter OK')\"",
         f"mkdir -p {REPO_DIR}/hy3dpaint/ckpt && wget -q -O {REPO_DIR}/hy3dpaint/ckpt/RealESRGAN_x4plus.pth "
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
         # Fail the build here, not on the first job, if Blender can't load headless.

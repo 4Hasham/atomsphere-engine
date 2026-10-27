@@ -582,20 +582,28 @@ def trigger_job(payload: dict):
 
 @app.local_entrypoint()
 def main(
+    image: Optional[str] = None,
     bucket: Optional[str] = None,
     key: Optional[str] = None,
     prompt: Optional[str] = None,
     output_path: str = "output_21.glb",
 ):
     """Try one job without S3 output, e.g. for the comparison set:
-    modal run inference/api_21.py --bucket my-bucket --key uploads/x/input.jpg
+    modal run api_21.py --image villa.jpg                      (local file, no AWS)
+    modal run api_21.py --bucket my-bucket --key uploads/x/input.jpg
+    modal run api_21.py --prompt "a brass desk lamp"
+
+    --bucket/--key read S3 with this machine's AWS credentials; with `aws login`
+    credentials boto3 needs `pip install "botocore[crt]"`.
     """
     model = Hunyuan21Model()
     image_bytes = None
-    if bucket and key:
+    if image:
+        image_bytes = Path(image).read_bytes()
+    elif bucket and key:
         image_bytes = model.access_aws().get_object(Bucket=bucket, Key=key)["Body"].read()
     elif not prompt:
-        raise SystemExit("Pass --bucket and --key for an image, or --prompt for text.")
+        raise SystemExit("Pass --image for a local photo, --bucket and --key for one in S3, or --prompt for text.")
 
     glb_data = model.generate_3d.remote(image_bytes=image_bytes, prompt=prompt)
     Path(output_path).write_bytes(glb_data)

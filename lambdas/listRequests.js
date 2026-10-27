@@ -52,7 +52,7 @@ export const handler = async (event) => {
         ExpressionAttributeValues: { ':ownerId': ownerId },
         // Placeholders for every newer field, so none can clash with a DynamoDB reserved word.
         ProjectionExpression: 'job_id, #status, created_at, updated_at, prompt, input_key, output_bucket, output_key, '
-          + '#title, #description, #category, #input_mode, #model',
+          + '#title, #description, #category, #input_mode, #model, #size_m',
         ExpressionAttributeNames: {
           '#status': 'status',
           '#title': 'title',
@@ -60,6 +60,7 @@ export const handler = async (event) => {
           '#category': 'category',
           '#input_mode': 'input_mode',
           '#model': 'model',
+          '#size_m': 'size_m',
         },
         ScanIndexForward: false,
         ExclusiveStartKey: lastEvaluatedKey,

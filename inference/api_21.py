@@ -1,6 +1,7 @@
-"""Hunyuan3D-2.1 pipeline: PBR textures (albedo + metallic/roughness) for single-photo
-and text jobs. Three-photo jobs are forwarded to the 2.0 app (api.py), because 2.1 has
-no multi-view shape model.
+"""Hunyuan3D-2.1 pipeline: PBR textures (albedo + metallic/roughness) for every Standard
+job. Text and single-photo jobs run on 2.1 end to end. Three-photo jobs get their shape
+from the 2.0 app's multi-view model (api.py, generate_multiview_shape), because 2.1 has
+none, and their PBR textures here.
 
 Deployed as its own Modal app so the 2.0 endpoint keeps serving while this one is
 compared and rolled out. It reuses the "hunyuan3d-weights" volume.
@@ -429,8 +430,6 @@ class Hunyuan21Model:
         job_id: Optional[str] = None,
         output_bucket: Optional[str] = None,
     ) -> bytes | str:
-        import shutil
-
         import torch
 
         torch.cuda.reset_peak_memory_stats()
@@ -459,6 +458,35 @@ class Hunyuan21Model:
         mesh = cleanup_and_decimate(mesh, MAX_FACES_FOR_TEXTURING)
         print(f"--> Cleanup/decimation in {time.perf_counter() - started:.1f}s; faces: {len(mesh.faces)}", flush=True)
 
+        return self._texture_and_store(mesh, input_image, job_id, output_bucket, job_started)
+
+    @modal.method()
+    def texture_mesh(
+        self,
+        mesh_glb: bytes,
+        front_png: bytes,
+        job_id: Optional[str] = None,
+        output_bucket: Optional[str] = None,
+    ) -> bytes | str:
+        """PBR-texture a mesh made elsewhere: three-photo jobs, whose shape comes from
+        the 2.0 multi-view model. 2.1's painter uses a single reference image, so it
+        textures from the (background-removed) front photo."""
+        import torch
+        import trimesh
+        from PIL import Image
+
+        torch.cuda.reset_peak_memory_stats()
+        mesh = trimesh.load(io.BytesIO(mesh_glb), file_type="glb", force="mesh", process=False)
+        front = Image.open(io.BytesIO(front_png)).convert("RGBA")
+        print(f"--> Texturing a {len(mesh.faces)}-face multi-view mesh with 2.1 PBR", flush=True)
+        return self._texture_and_store(mesh, front, job_id, output_bucket, time.perf_counter())
+
+    def _texture_and_store(self, mesh, reference_image, job_id, output_bucket, job_started) -> bytes | str:
+        """Stage 2 (PBR paint), GLB export with checks, and the optional S3 upload."""
+        import shutil
+
+        import torch
+
         # The 2.1 paint pipeline works on files: OBJ in, OBJ + GLB out.
         work_dir = tempfile.mkdtemp(prefix="hy21-")
         try:
@@ -469,12 +497,17 @@ class Hunyuan21Model:
             started = time.perf_counter()
             textured_obj = self.paint_pipeline(
                 mesh_path=white_mesh_path,
-                image_path=input_image,
+                image_path=reference_image,
                 output_mesh_path=os.path.join(work_dir, "textured_mesh.obj"),
-                use_remesh=False,  # already cleaned and decimated above
+                use_remesh=False,  # already cleaned and decimated
                 save_glb=True,
             )
-            log_stage("Stage 2 PBR texture painting", started)
+            torch.cuda.synchronize()
+            print(
+                f"--> Stage 2 PBR texture painting completed in {time.perf_counter() - started:.1f}s; "
+                f"peak GPU {torch.cuda.max_memory_allocated() / (1024 ** 3):.1f} GiB",
+                flush=True,
+            )
 
             # convert_obj_to_glb swallows Blender errors and returns False, so check the
             # file: fall back to building it without Blender, and fail the job (rather
@@ -510,6 +543,25 @@ class Hunyuan21Model:
         return glb_data
 
 
+@app.function(image=hunyuan21_image, timeout=3600)
+def run_multiview_job(
+    multiview_images: dict[str, bytes],
+    job_id: Optional[str] = None,
+    output_bucket: Optional[str] = None,
+) -> bytes | str:
+    """Three-photo Standard job: shape from all three photos on the 2.0 app's
+    multi-view model, then 2.1 PBR textures. Runs on CPU so neither GPU sits idle
+    waiting for the other."""
+    started = time.perf_counter()
+    legacy = modal.Cls.from_name(LEGACY_APP, LEGACY_CLASS)()
+    shape = legacy.generate_multiview_shape.remote(multiview_images)
+    print(f"--> 2.0 multi-view shape ready in {time.perf_counter() - started:.1f}s", flush=True)
+    result = Hunyuan21Model().texture_mesh.remote(
+        shape["mesh_glb"], shape["front_png"], job_id=job_id, output_bucket=output_bucket
+    )
+    print(f"--> Three-photo job done in {time.perf_counter() - started:.1f}s", flush=True)
+    return result
+
 @app.function(image=hunyuan21_image)
 # requires_proxy_auth: Modal rejects requests (401) without valid Modal-Key and
 # Modal-Secret headers, before a container starts. Same contract as api.py, so the
@@ -533,7 +585,7 @@ def trigger_job(payload: dict):
     s3 = model.access_aws()
 
     if input_mode == "multiview":
-        # 2.1 has no multi-view shape model: hand the job to the 2.0 app unchanged.
+        # 2.1 has no multi-view shape model: shape from the 2.0 app, PBR textures here.
         required_views = ("front", "left", "back")
         if not views or any(
             not views.get(view, {}).get("bucket") or not views.get(view, {}).get("key")
@@ -547,16 +599,8 @@ def trigger_job(payload: dict):
             view: s3.get_object(Bucket=views[view]["bucket"], Key=views[view]["key"])["Body"].read()
             for view in required_views
         }
-        legacy = modal.Cls.from_name(LEGACY_APP, LEGACY_CLASS)()
-        legacy.generate_3d.spawn(
-            image_bytes=None,
-            prompt=prompt,
-            job_id=job_id,
-            output_bucket=output_bucket,
-            model_mode="multiview",
-            multiview_images=multiview_images,
-        )
-        print("Forwarded multiview job to the Hunyuan3D 2.0 app")
+        run_multiview_job.spawn(multiview_images, job_id=job_id, output_bucket=output_bucket)
+        print("Running multiview job: 2.0 multi-view shape + 2.1 PBR textures")
     elif input_mode == "single" and bucket and key:
         image_bytes = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
         print(f"Running 2.1 Image-to-3D for file: {bucket}/{key}")
@@ -583,6 +627,9 @@ def trigger_job(payload: dict):
 @app.local_entrypoint()
 def main(
     image: Optional[str] = None,
+    front: Optional[str] = None,
+    left: Optional[str] = None,
+    back: Optional[str] = None,
     bucket: Optional[str] = None,
     key: Optional[str] = None,
     prompt: Optional[str] = None,
@@ -592,10 +639,19 @@ def main(
     modal run api_21.py --image villa.jpg                      (local file, no AWS)
     modal run api_21.py --bucket my-bucket --key uploads/x/input.jpg
     modal run api_21.py --prompt "a brass desk lamp"
+    modal run api_21.py --front f.jpg --left l.jpg --back b.jpg   (three-photo hybrid)
 
     --bucket/--key read S3 with this machine's AWS credentials; with `aws login`
     credentials boto3 needs `pip install "botocore[crt]"`.
     """
+    if front or left or back:
+        if not (front and left and back):
+            raise SystemExit("Three-photo runs need --front, --left and --back.")
+        views = {name: Path(path).read_bytes() for name, path in (("front", front), ("left", left), ("back", back))}
+        Path(output_path).write_bytes(run_multiview_job.remote(views))
+        print(f"Saved {output_path}")
+        return
+
     model = Hunyuan21Model()
     image_bytes = None
     if image:

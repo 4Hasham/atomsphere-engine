@@ -403,6 +403,52 @@ class Hunyuan3DMultimodalModel:
         return glb_data
 
 
+    @modal.method()
+    def generate_multiview_shape(self, multiview_images: dict[str, bytes]) -> dict:
+        """Shape only, for the 2.1 app's three-photo Standard jobs (2.1 has no
+        multi-view shape model). Returns the cleaned, untextured mesh as GLB bytes and
+        the background-removed front photo as PNG bytes for 2.1's PBR texturing.
+
+        The 2.1 app calls this by name: keep the app and class names unchanged.
+        """
+        import gc
+
+        import torch
+
+        required_views = ("front", "left", "back")
+        if not multiview_images or any(not multiview_images.get(view) for view in required_views):
+            raise ValueError("Multiview generation requires front, left, and back image bytes.")
+
+        started = time.perf_counter()
+        prepared_views = {view: self.resolve_image(multiview_images[view], prompt=None) for view in required_views}
+
+        shape_pipeline = self.get_shape_pipeline("multiview")
+        shape_pipeline.to("cuda")
+        try:
+            mesh = shape_pipeline(
+                image=prepared_views,
+                octree_resolution=OCTREE_RESOLUTION,
+                generator=torch.manual_seed(SHAPE_SEED),
+            )[0]
+        finally:
+            shape_pipeline.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+        print(f"--> Multiview shape: {len(mesh.faces)} raw faces", flush=True)
+
+        mesh = cleanup_and_decimate(mesh, MAX_FACES_FOR_TEXTURING)
+        mesh_buffer = io.BytesIO()
+        mesh.export(mesh_buffer, file_type="glb")
+        front_buffer = io.BytesIO()
+        prepared_views["front"].save(front_buffer, format="PNG")
+        print(
+            f"--> Multiview shape for 2.1 done in {time.perf_counter() - started:.1f}s; "
+            f"{len(mesh.faces)} faces after cleanup",
+            flush=True,
+        )
+        return {"mesh_glb": mesh_buffer.getvalue(), "front_png": front_buffer.getvalue()}
+
+
 @app.function(image=hunyuan_image)
 # requires_proxy_auth: Modal rejects requests (401) unless they carry valid
 # Modal-Key and Modal-Secret headers from a Proxy Auth Token. The check runs

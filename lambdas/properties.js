@@ -10,6 +10,11 @@
 // POST { action: "load", id }                               -> { id, title, scene, imageUrls: { key: url } }
 // POST { action: "save", id, scene, title? }                -> { id, updatedAt }
 // POST { action: "image", id, levelId, contentType, size }  -> { key, upload } (presigned POST)
+// POST { action: "share", id }                              -> { token } (the same one until unshared)
+// POST { action: "unshare", id }                            -> { id }
+//
+// Sharing gives the property a random token; shared.js shows it to anyone with the link
+// (/p/<token>) through properties/shares/<token>.json, which names the property and owner.
 
 import crypto from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -82,6 +87,7 @@ class ClientError extends Error {
 }
 
 const sceneKey = (id) => `properties/${id}/scene.json`;
+const shareKey = (token) => `properties/shares/${token}.json`;
 const validId = (id) => typeof id === 'string' && /^prop-[A-Za-z0-9-]{1,64}$/.test(id);
 
 async function findOwnedProperty(tableName, id, ownerId) {
@@ -148,7 +154,7 @@ async function load(tableName, bucket, owner, payload) {
       expiresIn: IMAGE_URL_TTL_SECONDS,
     });
   }));
-  return response(200, { id: item.job_id, title: item.title, scene, imageUrls });
+  return response(200, { id: item.job_id, title: item.title, scene, imageUrls, shareToken: item.share_token ?? null });
 }
 
 async function save(tableName, bucket, owner, payload) {
@@ -203,6 +209,46 @@ async function image(tableName, bucket, owner, payload) {
   return response(200, { key, upload });
 }
 
+async function share(tableName, bucket, owner, payload) {
+  const item = await findOwnedProperty(tableName, payload.id, owner.userId);
+  if (item.share_token) return response(200, { token: item.share_token });
+  // 128 random bits: links can't be guessed or listed.
+  const token = crypto.randomBytes(16).toString('base64url');
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: shareKey(token),
+    Body: JSON.stringify({ propertyId: item.job_id, ownerId: owner.userId, createdAt: new Date().toISOString() }),
+    ContentType: 'application/json',
+  }));
+  await dynamodb.send(new UpdateCommand({
+    TableName: tableName,
+    Key: { job_id: item.job_id, created_at: item.created_at },
+    UpdateExpression: 'SET share_token = :token',
+    ExpressionAttributeValues: { ':token': token },
+  }));
+  return response(200, { token });
+}
+
+async function unshare(tableName, bucket, owner, payload) {
+  const item = await findOwnedProperty(tableName, payload.id, owner.userId);
+  if (item.share_token) {
+    // Overwritten rather than deleted (the role can write here, not delete), and the row
+    // forgets the token, so shared.js refuses the old link either way.
+    await s3.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: shareKey(item.share_token),
+      Body: JSON.stringify({ revoked: true }),
+      ContentType: 'application/json',
+    }));
+    await dynamodb.send(new UpdateCommand({
+      TableName: tableName,
+      Key: { job_id: item.job_id, created_at: item.created_at },
+      UpdateExpression: 'REMOVE share_token',
+    }));
+  }
+  return response(200, { id: item.job_id });
+}
+
 export const handler = async (event) => {
   const method = event?.httpMethod || event?.requestContext?.http?.method;
   if (method === 'OPTIONS') return { statusCode: 204, headers: corsHeaders, body: '' };
@@ -229,7 +275,9 @@ export const handler = async (event) => {
     if (payload.action === 'load') return await load(tableName, bucket, owner, payload);
     if (payload.action === 'save') return await save(tableName, bucket, owner, payload);
     if (payload.action === 'image') return await image(tableName, bucket, owner, payload);
-    return response(400, { error: 'action must be "create", "load", "save" or "image".' });
+    if (payload.action === 'share') return await share(tableName, bucket, owner, payload);
+    if (payload.action === 'unshare') return await unshare(tableName, bucket, owner, payload);
+    return response(400, { error: 'action must be "create", "load", "save", "image", "share" or "unshare".' });
   } catch (error) {
     if (error instanceof ClientError) return response(error.status, { error: error.message });
     console.error('Property request failed:', error);

@@ -135,8 +135,7 @@ export const handler = async (event) => {
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
-  try {
-    const reply = await fetch(`${url.replace(/\/$/, '')}/chat/completions`, {
+  const ask = () => fetch(`${url.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -154,12 +153,26 @@ export const handler = async (event) => {
         }],
       }),
     });
-    const result = await reply.json().catch(() => ({}));
-    if (!reply.ok) {
-      console.error('Plan reader model error:', reply.status, JSON.stringify(result).slice(0, 500));
-      return response(502, { error: "The plan reader couldn't read this plan. Please try again." });
+  try {
+    // Now and then the model's JSON comes back malformed even in JSON mode: ask once more.
+    let result;
+    let raw;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const reply = await ask();
+      result = await reply.json().catch(() => ({}));
+      if (!reply.ok) {
+        console.error('Plan reader model error:', reply.status, JSON.stringify(result).slice(0, 500));
+        return response(502, { error: "The plan reader couldn't read this plan. Please try again." });
+      }
+      try {
+        raw = parseJson(result.choices?.[0]?.message?.content);
+        break;
+      } catch (parseError) {
+        console.error(`Plan reader reply ${attempt} wasn't JSON:`, parseError.message);
+        if (attempt === 2) throw parseError;
+      }
     }
-    const reading = cleanReading(parseJson(result.choices?.[0]?.message?.content));
+    const reading = cleanReading(raw);
     console.log('Plan read:', JSON.stringify({
       model, walls: reading.walls.length, openings: reading.openings.length, rooms: reading.rooms.length,
       dimensions: reading.dimensions.length, usage: result.usage,

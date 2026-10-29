@@ -61,12 +61,12 @@ Read the plan in the image and reply with JSON only, in exactly this shape:
   "dimensions": [{ "text": "32'-10\\"", "a": [x, y], "b": [x, y] }]
 }
 
-Every point is [x, y] in ${space}.
-- walls: one straight segment per wall, along the wall's centre line, from corner to corner (split a wall where another meets it). Include walls with doors or windows in them, running straight through the opening. "exterior": true for the outer walls of the house.
-- openings: each door and window, "a" and "b" being the two ends of the gap in the wall.
-- rooms: every room and space with its label as printed, its type (one of ${[...ROOM_TYPES].join(', ')}), the size printed in it if any (e.g. 12'-0" x 14'-6"), and its outline as a polygon.
-- dimensions: each dimension line with its printed length and the two ends of what it measures.
-Read only one floor (the main or first plan if the sheet has several). Leave out furniture, text that isn't a room name or size, hatching and grid lines. If something is unclear, leave it out rather than guess.`;
+Every point is [x, y] in ${space}. The plan may not fill the image: blank white space around it is padding.
+- walls: walls are the thick solid bands (often black, grey or hatched). Thin lines are furniture, fixtures, steps, hatching or dimension lines, never walls. Give one straight segment per wall along its centre line, from corner to corner, split where another wall meets it, running straight through any door or window in it. "exterior": true for the outer walls of the house.
+- openings: each door (a gap in a wall, usually with a swing arc) and window (thin parallel lines across a wall), "a" and "b" being the two ends of the gap.
+- rooms: every room and space, with its label exactly as printed (or a fitting name if none is printed), its type (one of ${[...ROOM_TYPES].join(', ')}), its outline as a polygon along the inside of its walls, and "size": the size printed inside it, copied exactly (e.g. 12'-0" x 14'-6"), or "" when none is printed. Never estimate a size.
+- dimensions: only dimension lines that have a printed length, with that text copied exactly and the two ends of what the line measures. Never estimate a length.
+Read only one floor (the main or first plan if the sheet has several). Leave out furniture, fixtures, text that isn't a room name or size, hatching and grid lines. If something is unclear, leave it out rather than guess.`;
 }
 
 const isNumber = (value) => typeof value === 'number' && Number.isFinite(value);

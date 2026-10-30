@@ -166,6 +166,9 @@ PAINT_VIEWS = 6
 PAINT_RESOLUTION = 512
 
 T2I_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+# SDXL's own VAE overflows in fp16 and can decode to an all-black picture; this one is
+# the same VAE finetuned to stay in range at fp16 (MIT).
+T2I_VAE = "madebyollin/sdxl-vae-fp16-fix"
 T2I_STEPS = 30
 T2I_GUIDANCE = 7.0
 T2I_PROMPT_SUFFIX = (
@@ -179,6 +182,8 @@ T2I_NEGATIVE_PROMPT = (
 
 BIREFNET_MODEL = "ZhengPeng7/BiRefNet"
 BIREFNET_REVISION = "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4"
+# A cut-out with less of its pixels than this share solid has found no object.
+MIN_OBJECT_SHARE = 0.005
 
 
 def use_repo_modules():
@@ -217,12 +222,28 @@ class BiRefNetRemover:
         from torchvision.transforms.functional import to_pil_image
 
         image = image.convert("RGB")
-        batch = self.transform(image).unsqueeze(0).to("cuda").half()
+        batch = self.transform(image).unsqueeze(0).to("cuda")
         with self.torch.no_grad():
-            mask = self.model(batch)[-1].sigmoid()[0].float().cpu()
+            mask = self.model(batch.half())[-1].sigmoid()[0].float().cpu()
+            if self.torch.isnan(mask).any():
+                # fp16 overflowed on this picture: once more in fp32.
+                print("--> BiRefNet gave NaN in fp16; rerunning in fp32", flush=True)
+                self.model.float()
+                try:
+                    mask = self.model(batch.float())[-1].sigmoid()[0].float().cpu()
+                finally:
+                    self.model.half()
         cutout = image.copy()
         cutout.putalpha(to_pil_image(mask).resize(image.size))
         return cutout
+
+
+def has_object(image) -> bool:
+    """Whether an RGBA cut-out holds anything solid."""
+    import numpy as np
+
+    alpha = np.asarray(image.getchannel("A"))
+    return (alpha > 127).mean() >= MIN_OBJECT_SHARE
 
 
 def cleanup_and_decimate(mesh, max_faces: int):
@@ -315,6 +336,7 @@ def download_weights():
     snapshot_download("facebook/dinov2-giant")
     snapshot_download(BIREFNET_MODEL, revision=BIREFNET_REVISION)
     snapshot_download(T2I_MODEL, allow_patterns=["*.json", "*.txt", "*fp16.safetensors"])
+    snapshot_download(T2I_VAE, allow_patterns=["*.json", "*.safetensors"])
     weights_volume.commit()
     print("--> Weights are on the volume.")
 
@@ -392,11 +414,12 @@ class Hunyuan21Model:
         else:
             if self.t2i_pipeline is None:
                 import torch
-                from diffusers import AutoPipelineForText2Image
+                from diffusers import AutoencoderKL, AutoPipelineForText2Image
 
                 print("--> Loading text-to-image pipeline on demand...")
                 self.t2i_pipeline = AutoPipelineForText2Image.from_pretrained(
                     T2I_MODEL,
+                    vae=AutoencoderKL.from_pretrained(T2I_VAE, torch_dtype=torch.float16),
                     torch_dtype=torch.float16,
                     variant="fp16",
                 )
@@ -414,13 +437,40 @@ class Hunyuan21Model:
             ).images[0]
 
         # Real transparency (a cut-out) skips background removal.
-        if input_image.mode == "RGB":
-            print("--> Removing background...", flush=True)
-            input_image = self.bg_remover(input_image)
-        elif input_image.mode == "RGBA" and input_image.getchannel("A").getextrema()[0] == 255:
-            print("--> Removing background...", flush=True)
-            input_image = self.bg_remover(input_image.convert("RGB"))
+        if input_image.mode == "RGB" or input_image.getchannel("A").getextrema()[0] == 255:
+            input_image = self.cut_out(input_image.convert("RGB"))
+        if not has_object(input_image):
+            raise ValueError("No object could be found in the picture. Use a photo of one object on a plain background.")
         return input_image
+
+    def cut_out(self, image):
+        """The object cut out of its background (RGBA), or a readable error if the
+        picture has nothing in it to cut out."""
+        import numpy as np
+        from PIL import Image
+
+        pixels = np.asarray(image, dtype=np.float32)
+        print(f"--> Removing background (picture mean {pixels.mean():.0f}, spread {pixels.std():.1f})...", flush=True)
+        if pixels.std() < 2:
+            raise ValueError("The picture came out blank, so there was nothing to model. Please try again, or reword the prompt.")
+        cutout = self.bg_remover(image)
+        if has_object(cutout):
+            return cutout
+        print("--> The background remover found no object; trying rembg", flush=True)
+        from hy3dshape.rembg import BackgroundRemover
+
+        cutout = BackgroundRemover()(image)
+        if has_object(cutout):
+            return cutout
+        # Last resort, for a single object on a plain background (as prompts ask for):
+        # whatever clearly differs from the colour all round the edge.
+        print("--> rembg found none either; cutting out against the plain background", flush=True)
+        border = np.concatenate([pixels[0], pixels[-1], pixels[:, 0], pixels[:, -1]])
+        background = np.median(border, axis=0)
+        alpha = (np.linalg.norm(pixels - background, axis=-1) > 40).astype(np.uint8) * 255
+        cutout = image.copy()
+        cutout.putalpha(Image.fromarray(alpha))
+        return cutout
 
     @modal.method()
     def generate_3d(

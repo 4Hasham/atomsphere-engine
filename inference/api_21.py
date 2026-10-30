@@ -16,6 +16,7 @@ the Community licence.
 """
 
 import io
+import json
 import os
 import tempfile
 import time
@@ -238,6 +239,56 @@ class BiRefNetRemover:
         return cutout
 
 
+class JobError(ValueError):
+    """A failure whose message is written for the person who asked for the model."""
+
+
+GENERIC_FAILURE = "The 3D model couldn't be made this time. Please try again."
+
+
+def s3_client():
+    """S3 as this Modal workspace's AWS role (or local credentials when run locally)."""
+    import boto3
+
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    token = os.environ.get("MODAL_IDENTITY_TOKEN")
+    if not token:
+        return boto3.client("s3", region_name=region)
+
+    sts = boto3.client("sts", region_name=region)
+    assumed_role = sts.assume_role_with_web_identity(
+        RoleArn="arn:aws:iam::449563540770:role/ModalWebIdentity",
+        RoleSessionName="modal-session",
+        WebIdentityToken=token,
+    )
+    creds = assumed_role["Credentials"]
+    return boto3.client(
+        "s3",
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+
+
+def report_failure(job_id: Optional[str], output_bucket: Optional[str], error: Exception) -> None:
+    """Leaves assets/<job>.failed.json beside where the model would have gone, so the
+    status Lambda marks the job failed with a reason (it would otherwise look like it's
+    still being made). Never raises: the original error is what matters."""
+    if not job_id or not output_bucket:
+        return
+    reason = str(error) if isinstance(error, JobError) else GENERIC_FAILURE
+    try:
+        s3_client().put_object(
+            Bucket=output_bucket,
+            Key=f"assets/{job_id}.failed.json",
+            Body=json.dumps({"reason": reason, "error": f"{type(error).__name__}: {error}"[:500]}).encode(),
+            ContentType="application/json",
+        )
+        print(f"--> Reported the failure of job {job_id}: {reason}", flush=True)
+    except Exception as report_error:  # noqa: BLE001
+        print(f"--> Couldn't report the failure of job {job_id}: {report_error}", flush=True)
+
+
 def has_object(image) -> bool:
     """Whether an RGBA cut-out holds anything solid."""
     import numpy as np
@@ -384,26 +435,7 @@ class Hunyuan21Model:
 
     @staticmethod
     def access_aws():
-        import boto3
-
-        region = os.environ.get("AWS_REGION", "us-east-1")
-        token = os.environ.get("MODAL_IDENTITY_TOKEN")
-        if not token:
-            return boto3.client("s3", region_name=region)
-
-        sts = boto3.client("sts", region_name=region)
-        assumed_role = sts.assume_role_with_web_identity(
-            RoleArn="arn:aws:iam::449563540770:role/ModalWebIdentity",
-            RoleSessionName="modal-session",
-            WebIdentityToken=token,
-        )
-        creds = assumed_role["Credentials"]
-        return boto3.client(
-            "s3",
-            aws_access_key_id=creds["AccessKeyId"],
-            aws_secret_access_key=creds["SecretAccessKey"],
-            aws_session_token=creds["SessionToken"],
-        )
+        return s3_client()
 
     def resolve_image(self, image_bytes, prompt: Optional[str]):
         from PIL import Image
@@ -440,7 +472,7 @@ class Hunyuan21Model:
         if input_image.mode == "RGB" or input_image.getchannel("A").getextrema()[0] == 255:
             input_image = self.cut_out(input_image.convert("RGB"))
         if not has_object(input_image):
-            raise ValueError("No object could be found in the picture. Use a photo of one object on a plain background.")
+            raise JobError("No object could be found in the picture. Use a photo of one object on a plain background.")
         return input_image
 
     def cut_out(self, image):
@@ -452,7 +484,7 @@ class Hunyuan21Model:
         pixels = np.asarray(image, dtype=np.float32)
         print(f"--> Removing background (picture mean {pixels.mean():.0f}, spread {pixels.std():.1f})...", flush=True)
         if pixels.std() < 2:
-            raise ValueError("The picture came out blank, so there was nothing to model. Please try again, or reword the prompt.")
+            raise JobError("The picture came out blank, so there was nothing to model. Please try again, or reword the prompt.")
         cutout = self.bg_remover(image)
         if has_object(cutout):
             return cutout
@@ -480,6 +512,13 @@ class Hunyuan21Model:
         job_id: Optional[str] = None,
         output_bucket: Optional[str] = None,
     ) -> bytes | str:
+        try:
+            return self._generate_3d(image_bytes, prompt, job_id, output_bucket)
+        except Exception as error:
+            report_failure(job_id, output_bucket, error)
+            raise
+
+    def _generate_3d(self, image_bytes, prompt, job_id, output_bucket) -> bytes | str:
         import torch
 
         torch.cuda.reset_peak_memory_stats()
@@ -521,6 +560,13 @@ class Hunyuan21Model:
         """PBR-texture a mesh made elsewhere: three-photo jobs, whose shape comes from
         the 2.0 multi-view model. 2.1's painter uses a single reference image, so it
         textures from the (background-removed) front photo."""
+        try:
+            return self._texture_mesh(mesh_glb, front_png, job_id, output_bucket)
+        except Exception as error:
+            report_failure(job_id, output_bucket, error)
+            raise
+
+    def _texture_mesh(self, mesh_glb, front_png, job_id, output_bucket) -> bytes | str:
         import torch
         import trimesh
         from PIL import Image
@@ -604,7 +650,12 @@ def run_multiview_job(
     waiting for the other."""
     started = time.perf_counter()
     legacy = modal.Cls.from_name(LEGACY_APP, LEGACY_CLASS)()
-    shape = legacy.generate_multiview_shape.remote(multiview_images)
+    try:
+        shape = legacy.generate_multiview_shape.remote(multiview_images)
+    except Exception as error:
+        # (Texturing reports its own failures.)
+        report_failure(job_id, output_bucket, error)
+        raise
     print(f"--> 2.0 multi-view shape ready in {time.perf_counter() - started:.1f}s", flush=True)
     result = Hunyuan21Model().texture_mesh.remote(
         shape["mesh_glb"], shape["front_png"], job_id=job_id, output_bucket=output_bucket
